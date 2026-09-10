@@ -1,0 +1,16 @@
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: musing-heisenberg-956263ff29-hc
+  namespace: apps-release
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 7070
+        requestPath: /docs
+  targetRef:
+    group: ""
+    kind: Service
+    name: musing-heisenberg-956263ff29-srv

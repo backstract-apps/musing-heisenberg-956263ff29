@@ -1,0 +1,348 @@
+name: CD - GitOps Deploy to GKE
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: gke-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  deploy-gitops:
+    name: Build Image, Push to GAR and Deploy to GKE
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # =========================================================
+      # GCP CONFIG
+      # =========================================================
+      GCP_PROJECT_ID: platform-test-487912
+      GKE_CLUSTER: lcnc-cluster-delhi
+      GKE_REGION: asia-south2
+      NAMESPACE: apps-release
+
+      GCP_WIF_PROVIDER: "projects/208126041268/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
+      GCP_WIF_SA: "github-deployer@platform-test-487912.iam.gserviceaccount.com"
+
+      # Artifact Registry (matches infra/k8s/gke/deployment.yaml)
+      GAR_HOST: asia-south2-docker.pkg.dev
+      GAR_REGISTRY: asia-south2-docker.pkg.dev/platform-test-487912/backstract-apps/backstract_apps
+
+      # =========================================================
+      # APPLICATION IMAGE
+      # =========================================================
+      # MUST MATCH the STATIC_TAG used by the AWS workflow.
+      STATIC_TAG: musing-heisenberg-956263ff29
+
+      # =========================================================
+      # KUBERNETES
+      # =========================================================
+      INFRA_DIR: infra/k8s/gke
+      DEPLOYMENT_NAME: musing-heisenberg-956263ff29-depl
+
+      # Legacy ECR path (for manifest rewrite when present)
+      ECR_IMAGE_PREFIX: 216084506783.dkr.ecr.ap-south-1.amazonaws.com/backstract_apps
+
+    steps:
+      # =========================================================
+      # 1. CHECKOUT
+      # =========================================================
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      # =========================================================
+      # 2. DEBUG
+      # =========================================================
+      - name: Debug GitHub environment
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Commit: $GITHUB_SHA"
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Runner: $(uname -a)"
+          echo "Docker:"
+          docker version
+          echo "Disk:"
+          df -h /
+          echo "Memory:"
+          free -h
+
+      # =========================================================
+      # 3. AUTHENTICATE TO GOOGLE CLOUD
+      # =========================================================
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_WIF_SA }}
+
+      # =========================================================
+      # 4. VERIFY GCP IDENTITY
+      # =========================================================
+      - name: Verify Google Cloud identity
+        run: |
+          set -euo pipefail
+
+          gcloud auth list
+
+          echo "Project:"
+          gcloud config get-value project
+
+          gcloud projects describe "${GCP_PROJECT_ID}" \
+            --format="value(projectId)"
+
+      # =========================================================
+      # 5. AUTHENTICATE DOCKER TO ARTIFACT REGISTRY
+      # =========================================================
+      - name: Configure Docker for Artifact Registry
+        run: |
+          set -euo pipefail
+
+          gcloud auth configure-docker "${GAR_HOST}" --quiet
+
+          echo "Docker authentication configured for ${GAR_HOST}"
+
+      # =========================================================
+      # 6. SETUP DOCKER BUILDX
+      # =========================================================
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # =========================================================
+      # 7. BUILD + PUSH APPLICATION IMAGE TO GAR
+      # =========================================================
+      - name: Build and Push Docker Image to Artifact Registry
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+
+          IMAGE="${GAR_REGISTRY}"
+
+          echo "=========================================="
+          echo "Building application image"
+          echo "=========================================="
+          echo "Image: ${IMAGE}"
+          echo "Static tag: ${STATIC_TAG}"
+          echo "Git SHA: ${GITHUB_SHA}"
+          echo "Platform: linux/amd64"
+          echo "=========================================="
+
+          docker buildx create \
+            --use \
+            --name gke-builder \
+            >/dev/null 2>&1 || docker buildx use gke-builder
+
+          docker buildx inspect --bootstrap
+
+          docker buildx build \
+            --platform linux/amd64 \
+            -t "${IMAGE}:${STATIC_TAG}" \
+            -t "${IMAGE}:${GITHUB_SHA}" \
+            --push \
+            .
+
+          echo ""
+          echo "=========================================="
+          echo "Image pushed successfully"
+          echo "=========================================="
+          echo "${IMAGE}:${STATIC_TAG}"
+          echo "${IMAGE}:${GITHUB_SHA}"
+
+      # =========================================================
+      # 8. GET GKE CREDENTIALS
+      # =========================================================
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_REGION }}
+
+      # =========================================================
+      # 9. VERIFY GKE ACCESS
+      # =========================================================
+      - name: Verify GKE access
+        run: |
+          set -euo pipefail
+
+          kubectl cluster-info
+
+          kubectl get nodes
+
+          kubectl get namespace "${NAMESPACE}" \
+            || kubectl create namespace "${NAMESPACE}"
+
+      # =========================================================
+      # 10. PROVISION APPLICATION SECRETS
+      # =========================================================
+      - name: Provision application secrets in GKE
+        run: |
+          set -euo pipefail
+
+          echo "${{ secrets.K8S_ENV_FILE }}" | base64 -d > .env
+
+          kubectl create secret generic \
+            app-secrets-coll-37552dbc44b945fb8d0eaf74197a9542 \
+            --namespace "${NAMESPACE}" \
+            --from-env-file=.env \
+            --dry-run=client \
+            -o yaml \
+            | kubectl apply -f -
+
+          rm -f .env
+
+          echo "Application secrets provisioned."
+
+      # =========================================================
+      # 11. SANITIZE GKE MANIFEST
+      # =========================================================
+      - name: Sanitize manifests for GKE Autopilot
+        env:
+          BST_TOKEN: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TARGET_FILE="${INFRA_DIR}/deployment.yaml"
+
+          if [ ! -f "${TARGET_FILE}" ]; then
+            echo "ERROR: ${TARGET_FILE} does not exist"
+            exit 1
+          fi
+
+          if [ -z "${BST_TOKEN}" ]; then
+            echo "ERROR: BACKSTRACT_AUTH_TOKEN is empty"
+            exit 1
+          fi
+
+          echo "Sanitizing ${TARGET_FILE}"
+
+          # Inject runtime BST token
+          awk -v token="${BST_TOKEN}" \
+            '{gsub(/PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME/, token)}1' \
+            "${TARGET_FILE}" \
+            > /tmp/clean_deployment.yaml
+
+          # Remove AWS-specific imagePullSecrets if present
+          sed -i '/imagePullSecrets:/,+2d' \
+            /tmp/clean_deployment.yaml
+
+          # Remove legacy tolerations
+          sed -i '/tolerations:/,+3d' \
+            /tmp/clean_deployment.yaml
+
+          # Remove legacy affinity
+          sed -i '/affinity:/,+8d' \
+            /tmp/clean_deployment.yaml
+
+          # Replace ECR registry with GAR if an old ECR image is still present
+          sed -i \
+            "s|${ECR_IMAGE_PREFIX}|${GAR_REGISTRY}|g" \
+            /tmp/clean_deployment.yaml
+
+          # Ensure the deployment references the GAR image
+          sed -i \
+            "s|image: .*musing-heisenberg-956263ff29.*|image: ${GAR_REGISTRY}:${GITHUB_SHA}|g" \
+            /tmp/clean_deployment.yaml
+
+          if grep -q "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME" \
+            /tmp/clean_deployment.yaml; then
+            echo "ERROR: BST token injection failed"
+            exit 1
+          fi
+
+          if grep -q "dkr.ecr" /tmp/clean_deployment.yaml; then
+            echo "ERROR: ECR reference still exists in GKE deployment"
+            grep "dkr.ecr" /tmp/clean_deployment.yaml
+            exit 1
+          fi
+
+          mv /tmp/clean_deployment.yaml "${TARGET_FILE}"
+
+          echo ""
+          echo "Final image:"
+          grep "image:" "${TARGET_FILE}"
+
+      # =========================================================
+      # 12. COMMIT SANITIZED MANIFEST
+      # =========================================================
+      - name: Commit sanitized GKE manifests
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${INFRA_DIR}/deployment.yaml"
+
+          if ! git diff-index --quiet HEAD; then
+            git commit \
+              -m "chore(gitops): update GKE deployment image [skip ci]"
+
+            git pull --rebase origin master
+
+            git push origin master
+
+            echo "Manifest changes pushed to Git."
+          else
+            echo "No manifest changes to commit."
+          fi
+
+      # =========================================================
+      # 13. TRIGGER ARGO CD
+      # =========================================================
+      - name: Trigger Argo CD webhook sync
+        run: |
+          set -euo pipefail
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "ref": "refs/heads/master",
+            "repository": {
+              "name": "${{ github.event.repository.name }}",
+              "html_url": "${{ github.server_url }}/${{ github.repository }}",
+              "clone_url": "${{ github.server_url }}/${{ github.repository }}.git"
+            },
+            "head_commit": {
+              "id": "${{ github.sha }}"
+            }
+          }
+          EOF
+          )
+
+          echo "Triggering Argo CD..."
+
+          curl \
+            --fail-with-body \
+            -X POST \
+            https://argocd.backstract.io/api/webhook \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: push" \
+            -d "${PAYLOAD}"
+
+          echo ""
+          echo "Argo CD webhook triggered successfully."
+
+      # =========================================================
+      # 14. WAIT FOR ROLLOUT TO SUCCEED
+      # =========================================================
+      - name: Wait for rollout to complete
+        run: |
+          set -euo pipefail
+
+          echo "Giving Argo CD a moment to pick up and apply the change..."
+          sleep 20
+
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" \
+            -n "${NAMESPACE}" \
+            --timeout=180s
+
+          echo "Rollout completed successfully."

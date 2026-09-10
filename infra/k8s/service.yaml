@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: musing-heisenberg-956263ff29-srv
+  namespace: apps-release
+spec:
+  selector:
+    app: musing-heisenberg-956263ff29
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 7070
+  type: ClusterIP

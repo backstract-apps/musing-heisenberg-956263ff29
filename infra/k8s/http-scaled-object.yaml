@@ -1,0 +1,24 @@
+kind: HTTPScaledObject
+apiVersion: http.keda.sh/v1alpha1
+metadata:
+  name: musing-heisenberg-956263ff29-scaler
+  namespace: apps-release
+spec:
+  hosts:
+    - cc1fbde45ead-in-south-01.mayson.dev
+  pathPrefixes:
+    - /us-east-1-backstractelb-8278b6-coll-37552dbc44b945fb8d0eaf74197a9542/ # e.g. /infallible-naveen-... musing-heisenberg-956263ff29/
+  scaleTargetRef:
+    name: musing-heisenberg-956263ff29-depl
+    kind: Deployment
+    apiVersion: apps/v1
+    service: musing-heisenberg-956263ff29-srv # e.g. coll-8a2a...-srv
+    port: 80
+  replicas:
+    min: 0
+    max: 10
+  scaledownPeriod: 1800 #inseconds
+  scalingMetric:
+    requestRate:
+      targetValue: 100
+      window: 1m
