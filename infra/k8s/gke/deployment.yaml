@@ -11,7 +11,7 @@ metadata:
     backstract.io/token-scope: "storage.*,cache.*"
 type: Opaque
 stringData:
-  token: "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME"
+  token: "bst_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJiYWNrc3RyYWN0LXBsYXRmb3JtIiwic3ViIjoiY29sbF8zNzU1MmRiYzQ0Yjk0NWZiOGQwZWFmNzQxOTdhOTU0MiIsImF1ZCI6ImJhY2tzdHJhY3QtcmVzb3VyY2VzIiwiZW52IjoicmVsZWFzZSIsImlhdCI6MTc4OTAzNjUxMSwiZXhwIjoxNzk2ODEyNTExLCJzY29wZXMiOlsic3RvcmFnZS4qIiwiY2FjaGUuKiJdLCJ0b2tlbl90eXBlIjoiYnN0Iiwib3duZXJfaWQiOiI5OTEyMzBkYWE1ODk0ODlmODQ2N2VhMWE1NWJlMTFlYiJ9.PMCSlIpJaWVmfWtTXf6SU0D0zhlVa5CD2zsHdWCDggo"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,9 +34,6 @@ spec:
         release: prometheus
     spec:
       #runtimeClassName: gvisor
-      #imagePullSecrets:
-        #- name: aws-ecr-creds
-      serviceAccountName: alloy-service-account
       volumes:
         - name: alloy-config
           configMap:
@@ -55,7 +52,7 @@ spec:
                   fieldPath: metadata.annotations
       containers:
         - name: musing-heisenberg-956263ff29
-          image: asia-south2-docker.pkg.dev/platform-test-487912/backstract-apps/backstract_apps:musing-heisenberg-956263ff29
+          image: asia-south2-docker.pkg.dev/platform-test-487912/backstract-apps/backstract_apps:d26c27ffa24c7801645254228626337207e50d52
           imagePullPolicy: Always
           env:
             - name: BACKSTRACT_AUTH_TOKEN
